@@ -1,0 +1,28 @@
+{
+  "name": "opencode-backoff",
+  "version": "0.1.0",
+  "description": "Exponential backoff resilience for OpenCode sessions: provider-aware retry policy overrides, per-provider circuit breakers, and unattended-session watchdog re-dispatch so transient upstream outages never brick an agent.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.mjs",
+    "verify": "npm run build && npm test"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "latest",
+    "typescript": "latest"
+  }
+}
