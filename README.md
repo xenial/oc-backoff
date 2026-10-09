@@ -1,4 +1,4 @@
-# @xenial/oc-backoff
+# oc-backoff
 
 Exponential backoff resilience for [OpenCode V2](https://opencode.ai/v2/docs/). Prevents transient upstream inference-provider failures (429s, 5xx, network resets, overload) from bricking unattended agents.
 
