@@ -1,5 +1,5 @@
 /**
- * Pure backoff, classification, and circuit-breaker logic for opencode-backoff.
+ * Pure backoff, classification, and circuit-breaker logic for @xenial/oc-backoff.
  *
  * This module has no dependency on the OpenCode plugin API so it can be unit
  * tested directly with node:test.

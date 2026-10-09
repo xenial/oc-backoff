@@ -57,7 +57,7 @@ function parseOptions(raw: unknown): BackoffPluginOptions {
 }
 
 export default Plugin.define({
-  id: "opencode-backoff",
+  id: "oc-backoff",
   async setup(ctx) {
     const opts = parseOptions(ctx.options)
     const circuits = new Map<string, CircuitBreaker>()
@@ -67,7 +67,7 @@ export default Plugin.define({
     // available attribution for a parked session.
     const lastProvider = new Map<string, string>()
     const providerFor = (sessionID: string): string | undefined => lastProvider.get(sessionID)
-    const log = (message: string) => console.error(`[opencode-backoff] ${message}`)
+    const log = (message: string) => console.error(`[oc-backoff] ${message}`)
 
     function circuitFor(providerID: string): CircuitBreaker {
       let circuit = circuits.get(providerID)

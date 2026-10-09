@@ -1,4 +1,4 @@
-# opencode-backoff
+# @xenial/oc-backoff
 
 Exponential backoff resilience for [OpenCode V2](https://opencode.ai/v2/docs/). Prevents transient upstream inference-provider failures (429s, 5xx, network resets, overload) from bricking unattended agents.
 
@@ -10,13 +10,18 @@ OpenCode's built-in retry policy is hard-capped at a handful of attempts with a 
 
 ## Install
 
+```sh
+opencode plugin add github:xenial/oc-backoff
+```
+
+Or configure it directly in `opencode.jsonc` (project or `~/.config/opencode/opencode.jsonc`):
+
 ```jsonc
-// opencode.jsonc (project or ~/.config/opencode/opencode.jsonc)
 {
   "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
-      "package": "/absolute/path/to/opencode-backoff",
+      "package": "github:xenial/oc-backoff",
       "options": {
         "baseDelayMs": 2000,
         "maxDelayMs": 300000,
@@ -38,6 +43,24 @@ OpenCode's built-in retry policy is hard-capped at a handful of attempts with a 
 
 All options are optional; the values shown are the defaults.
 
+### Install with an AI agent
+
+Paste this prompt into OpenCode (or any coding agent) to have it install the plugin for you:
+
+```text
+Install the OpenCode plugin @xenial/oc-backoff (repo: https://github.com/xenial/oc-backoff)
+globally so it applies to all my sessions. Run `opencode plugin add github:xenial/oc-backoff`,
+then restart the background service with `opencode service restart` and confirm the plugin
+loads without errors by checking for oc-backoff entries in
+~/.local/share/opencode/log/opencode.log. It is an exponential-backoff resilience plugin:
+it overrides retry delays for transient provider failures (429/5xx/network/overload),
+adds a per-provider circuit breaker, and re-dispatches parked sessions after outages
+up to 12 hours. If `opencode plugin add` is unavailable in my OpenCode version, clone the
+repo, run `npm install && npm run build` inside it, and create
+~/.config/opencode/plugin/oc-backoff.js containing a re-export of the built dist/index.js,
+then restart the service and verify as above.
+```
+
 ## Behavior
 
 | Failure | Classification | Policy |
@@ -55,7 +78,7 @@ The watchdog only re-dispatches sessions whose terminal error is transient-class
 
 ## Logging
 
-Decisions are logged to stderr with the `[opencode-backoff]` prefix: classification, proposed vs. applied delay, circuit state changes, park/re-dispatch events.
+Decisions are logged to stderr with the `[oc-backoff]` prefix: classification, proposed vs. applied delay, circuit state changes, park/re-dispatch events.
 
 ## Development
 
