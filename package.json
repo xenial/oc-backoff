@@ -1,5 +1,5 @@
 {
-  "name": "opencode-backoff",
+  "name": "@xenial/oc-backoff",
   "version": "0.1.0",
   "description": "Exponential backoff resilience for OpenCode sessions: provider-aware retry policy overrides, per-provider circuit breakers, and unattended-session watchdog re-dispatch so transient upstream outages never brick an agent.",
   "type": "module",
