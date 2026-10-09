@@ -172,6 +172,27 @@ test("circuit breaker ignores duplicate failure reports during cooldown", () => 
   assert.equal(circuit.snapshot(now).state, "open")
 })
 
+test("circuit cooldown is anchored at the first failure, not slid forward by stragglers", () => {
+  // Three concurrent sessions exhaust their retries against the same dead
+  // provider seconds apart. If openedAt were anchored at the LAST report,
+  // each straggler would push the probe point out; a steady trickle of
+  // sibling sessions could delay the probe arbitrarily. The window must be
+  // anchored at the FIRST failure of the run so the probe fires on schedule.
+  const circuit = new CircuitBreaker({ failureThreshold: 3, baseCooldownMs: 5_000, maxCooldownMs: 60_000 })
+  const t0 = 1_000_000
+
+  circuit.recordFailure(t0) // session A exhausts at t0
+  circuit.recordFailure(t0 + 3_000) // session B exhausts 3s later
+  circuit.recordFailure(t0 + 4_900) // session C exhausts 4.9s later, opening the circuit
+
+  assert.equal(circuit.snapshot(t0 + 4_900).state, "open")
+  // Probe is due 5s after the FIRST failure, not 5s after the last report.
+  assert.equal(circuit.admit(t0 + 5_001), true, "probe due at firstFailure + cooldown")
+  assert.equal(circuit.snapshot(t0 + 5_001).state, "half-open")
+  // And it must not have slid to lastReport + cooldown (t0 + 9_900).
+  assert.equal(circuit.admit(t0 + 9_899), true, "window must not slide to the last report")
+})
+
 test("circuit retryAfterMs reports remaining open time", () => {
   const circuit = new CircuitBreaker({ failureThreshold: 1, baseCooldownMs: 5_000, maxCooldownMs: 5_000 })
   const now = 100_000

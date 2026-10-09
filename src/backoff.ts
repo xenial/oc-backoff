@@ -209,6 +209,19 @@ export class CircuitBreaker {
   private consecutiveFailures = 0
   private openedAt = 0
   private cooldownMs: number
+  /**
+   * Timestamp of the FIRST exhaustion event in the current consecutive
+   * failure run. When the circuit transitions to open, the cooldown window
+   * is anchored here — NOT at the Nth failure's own timestamp.
+   *
+   * Anchoring openedAt at the last report would let concurrent sessions on
+   * the same dead provider slide the window forward: each sibling's
+   * exhaustion report arrives seconds apart, resets openedAt, and the probe
+   * point keeps moving out. Anchoring at the first failure of the run keeps
+   * the cooldown absolute, so probes happen on schedule no matter how many
+   * sessions pile onto the same outage.
+   */
+  private runStartedAt = 0
 
   constructor(private readonly opts: CircuitOptions = DEFAULT_CIRCUIT) {
     this.cooldownMs = opts.baseCooldownMs
@@ -243,25 +256,35 @@ export class CircuitBreaker {
    * Record that a full retry sequence was exhausted against this provider.
    * Pass the failure timestamp explicitly when it is known; observing the
    * breaker between the failure and this call does not count as a probe.
+   *
+   * Only failures that arrive while the circuit is closed (or as an admitted
+   * probe after cooldown) advance the failure count. Reports that arrive
+   * while the circuit is open and cooling down are siblings observing the
+   * same outage; they neither extend nor double the cooldown.
    */
-  recordFailure(failedAt?: number): void {
+  recordFailure(failedAt: number = Date.now()): void {
     if (this.state === "open") {
-      if (failedAt === undefined) failedAt = Date.now()
       if (failedAt < this.openedAt + this.cooldownMs) {
         // Still cooling down: not a probe, just another report of the same outage.
         return
       }
       // A request was admitted after cooldown and failed: probe failed.
-      // Re-open with doubled cooldown.
+      // Re-open with doubled cooldown, anchored at this probe.
       this.consecutiveFailures += 1
+      this.runStartedAt = failedAt
       this.openedAt = failedAt
       this.cooldownMs = Math.min(this.opts.maxCooldownMs, this.cooldownMs * 2)
       return
     }
+    if (this.consecutiveFailures === 0) this.runStartedAt = failedAt
     this.consecutiveFailures += 1
     if (this.consecutiveFailures >= this.opts.failureThreshold) {
       this.state = "open"
-      this.openedAt = failedAt ?? Date.now()
+      // Anchor the cooldown at the FIRST failure of this run. The failures
+      // that opened the circuit are all reports of the same outage that
+      // began at runStartedAt; anchoring at the latest report would let
+      // stragglers push the probe point out arbitrarily far.
+      this.openedAt = this.runStartedAt
     }
   }
 
@@ -271,6 +294,7 @@ export class CircuitBreaker {
     this.consecutiveFailures = 0
     this.cooldownMs = this.opts.baseCooldownMs
     this.openedAt = 0
+    this.runStartedAt = 0
   }
 
 }
