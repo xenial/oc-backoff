@@ -8,7 +8,7 @@
 export interface BackoffOptions {
   /** First retry delay in milliseconds. Default 2000. */
   baseDelayMs: number
-  /** Hard ceiling for any single retry delay. Default 300_000 (5 min). */
+  /** Ceiling for transient retry delays; quota waits may exceed it. Default 300_000. */
   maxDelayMs: number
   /** Random source, injectable for tests. Defaults to Math.random. */
   random?: () => number
@@ -18,7 +18,6 @@ export const DEFAULT_BASE_DELAY_MS = 2_000
 export const DEFAULT_MAX_DELAY_MS = 300_000
 export const DEFAULT_MAX_REDISPATCH_DELAY_MS = 1_800_000 // 30 min
 export const DEFAULT_OUTAGE_TOLERANCE_MS = 43_200_000 // 12 h
-export const DEFAULT_PROBE_MODEL_COUNT = 1
 
 /**
  * Full-jitter exponential backoff: uniform random in [0, min(cap, base * 2^n)].
@@ -51,6 +50,10 @@ interface ErrorLike {
   statusCode?: number
   type?: string
   message?: string
+  code?: string
+  cause?: unknown
+  response?: { body?: string }
+  responseHeaders?: Record<string, string>
   data?: {
     statusCode?: number
     message?: string
@@ -65,6 +68,12 @@ const NETWORK_PATTERNS = [
   "econnrefused",
   "econnaborted",
   "etimedout",
+  "eai_again",
+  "enotfound",
+  "und_err_connect_timeout",
+  "und_err_headers_timeout",
+  "und_err_body_timeout",
+  "und_err_socket",
   "fetch failed",
   "failed to fetch",
   "socket hang up",
@@ -72,11 +81,15 @@ const NETWORK_PATTERNS = [
   "connection reset",
   "connection refused",
   "connection timeout",
+  "timed out",
+  "network request failed",
+  "network connection was lost",
+  "load failed",
 ]
 
 const RATE_LIMIT_PATTERNS = ["rate limit", "too many requests", "too_many_requests", "rate increased too quickly"]
 const OVERLOAD_PATTERNS = ["overloaded", "exhausted", "unavailable", "capacity"]
-const QUOTA_PATTERNS = ["usage limit", "usagelimterror", "quota exceeded", "monthly quota", "weekly limit", "freeusagelimterror"]
+const QUOTA_PATTERNS = ["usage limit", "usagelimiterror", "quota exceeded", "insufficient_quota", "monthly quota", "weekly limit", "freeusagelimiterror"]
 
 function normalize(error: unknown): ErrorLike {
   if (error && typeof error === "object") return error as ErrorLike
@@ -88,28 +101,38 @@ function statusOf(error: ErrorLike): number | undefined {
 }
 
 function textOf(error: ErrorLike): string {
-  return [error.message, error.type, error.data?.message, error.data?.responseBody]
+  return [error.message, error.type, error.code, error.response?.body, error.data?.message, error.data?.responseBody]
     .filter((part): part is string => typeof part === "string")
     .join("\n")
     .toLowerCase()
 }
 
-function retryAfterOf(error: ErrorLike): number | undefined {
-  const headers = error.data?.responseHeaders
-  if (!headers) return undefined
-  const ms = headers["retry-after-ms"]
-  if (ms !== undefined) {
-    const parsed = Number.parseFloat(ms)
-    if (!Number.isNaN(parsed) && parsed >= 0) return parsed
+export function retryAfterFromHeaders(
+  headers: Headers | Record<string, string>,
+  now: number = Date.now(),
+): number | undefined {
+  const valueOf = (key: string): string | null => headers instanceof Headers
+    ? headers.get(key)
+    : Object.entries(headers).find(([name, value]) => name.toLowerCase() === key && typeof value === "string")?.[1] ?? null
+  const numeric = (value: string): number | undefined => {
+    if (!/^\d+(?:\.\d+)?$/.test(value.trim())) return undefined
+    const parsed = Number(value)
+    return Number.isSafeInteger(Math.ceil(parsed)) ? parsed : undefined
   }
-  const seconds = headers["retry-after"]
-  if (seconds !== undefined) {
-    const parsedSeconds = Number.parseFloat(seconds)
-    if (!Number.isNaN(parsedSeconds) && parsedSeconds >= 0) return Math.ceil(parsedSeconds * 1000)
-    const asDate = Date.parse(seconds)
+  const ms = valueOf("retry-after-ms")
+  if (ms !== null) {
+    const parsed = numeric(ms)
+    if (parsed !== undefined) return Math.ceil(parsed)
+  }
+  const seconds = valueOf("retry-after")
+  if (seconds !== null) {
+    const parsedSeconds = numeric(seconds)
+    if (parsedSeconds !== undefined && Number.isSafeInteger(Math.ceil(parsedSeconds * 1000))) return Math.ceil(parsedSeconds * 1000)
+    // An HTTP date contains a month name. Numeric prefixes ("120junk") and
+    // negative delays must not be interpreted as dates or partial numbers.
+    const asDate = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b/i.test(seconds) ? Date.parse(seconds) : NaN
     if (!Number.isNaN(asDate)) {
-      const delta = asDate - Date.now()
-      if (delta > 0) return Math.ceil(delta)
+      return Math.max(0, Math.ceil(asDate - now))
     }
   }
   return undefined
@@ -130,26 +153,47 @@ export function classify(rawError: unknown): ClassifiedError {
   const error = normalize(rawError)
   const status = statusOf(error)
   const text = textOf(error)
-  const retryAfterMs = retryAfterOf(error)
+  const headers = error.responseHeaders ?? error.data?.responseHeaders
+  const retryAfterMs = headers ? retryAfterFromHeaders(headers) : undefined
 
-  if (text.includes("context") && text.includes("overflow")) return { cls: "terminal" }
+  // Explicit SDK error types take precedence over incidental words such as
+  // "capacity" in an invalid-request or permission error.
+  if (typeof error.type === "string" && (
+    /^(permission|tool|session)\./.test(error.type) ||
+    /^provider\.(auth|invalid-request|content-filter|unsupported-operation|no-route|unknown|context-overflow)$/.test(error.type)
+  )) return { cls: "terminal" }
+  if (/context.{0,30}(overflow|too (large|long)|exceed)|maximum context length/i.test(text)) return { cls: "terminal" }
   if (status !== undefined) {
     if (status === 401 || status === 403) return { cls: "terminal" }
     if (status === 400 || status === 404 || status === 422) return { cls: "terminal" }
     if (status === 402) return { cls: "quota", retryAfterMs }
     if (status === 429) {
-      const cls: ErrorClass = QUOTA_PATTERNS.some((p) => text.includes(p)) ? "quota" : "rate-limit"
+      const cls: ErrorClass = error.type === "provider.quota" || QUOTA_PATTERNS.some((p) => text.includes(p)) ? "quota" : "rate-limit"
       return { cls, retryAfterMs }
     }
-    if (status >= 500) return { cls: "server-error", retryAfterMs }
+    if (status === 408) return { cls: "network", retryAfterMs }
+    if (status >= 500 && status < 600) return { cls: "server-error", retryAfterMs }
+    if (status >= 400 && status < 500) return { cls: "terminal" }
   }
 
+  if (error.type === "provider.quota") return { cls: "quota", retryAfterMs }
+  if (error.type === "provider.rate-limit") return { cls: "rate-limit", retryAfterMs }
+  if (error.type === "provider.transport" || error.type === "provider.timeout") return { cls: "network", retryAfterMs }
+  if (error.type === "provider.internal") return { cls: "server-error", retryAfterMs }
   if (QUOTA_PATTERNS.some((p) => text.includes(p))) return { cls: "quota", retryAfterMs }
   if (RATE_LIMIT_PATTERNS.some((p) => text.includes(p))) return { cls: "rate-limit", retryAfterMs }
   if (NETWORK_PATTERNS.some((p) => text.includes(p))) return { cls: "network", retryAfterMs }
   if (OVERLOAD_PATTERNS.some((p) => text.includes(p))) return { cls: "overloaded", retryAfterMs }
 
   if (error.data?.isRetryable === true) return { cls: "server-error", retryAfterMs }
+
+  // Node fetch failures often keep ECONNRESET/ETIMEDOUT in a nested cause.
+  let cause = error.cause
+  for (let depth = 0; cause && depth < 5; depth++) {
+    const nested = normalize(cause)
+    if (NETWORK_PATTERNS.some((p) => textOf(nested).includes(p))) return { cls: "network", retryAfterMs }
+    cause = nested.cause
+  }
 
   return { cls: "terminal" }
 }
@@ -167,7 +211,7 @@ export function retryDelay(classified: ClassifiedError, attempt: number, opts: B
     if (classified.cls === "quota") {
       return Math.max(opts.baseDelayMs, classified.retryAfterMs)
     }
-    return Math.max(opts.baseDelayMs, Math.min(opts.maxDelayMs, classified.retryAfterMs))
+    return Math.min(opts.maxDelayMs, Math.max(opts.baseDelayMs, classified.retryAfterMs))
   }
   const computed = backoffDelay(attempt, opts)
   return classified.cls === "quota" ? Math.max(computed, opts.maxDelayMs) : computed
@@ -222,9 +266,10 @@ export class CircuitBreaker {
    * sessions pile onto the same outage.
    */
   private runStartedAt = 0
+  private probeOwner?: string
 
   constructor(private readonly opts: CircuitOptions = DEFAULT_CIRCUIT) {
-    this.cooldownMs = opts.baseCooldownMs
+    this.cooldownMs = Math.min(opts.baseCooldownMs, opts.maxCooldownMs)
   }
 
   snapshot(now: number = Date.now()): CircuitSnapshot {
@@ -246,6 +291,19 @@ export class CircuitBreaker {
     return this.state !== "open" || now >= this.openedAt + this.cooldownMs
   }
 
+  /** Reserve the single half-open probe; its retries retain the same owner. */
+  acquireProbe(owner: string, now: number = Date.now()): boolean {
+    if (!this.admit(now)) return false
+    if (this.state === "closed") return true
+    if (this.probeOwner !== undefined && this.probeOwner !== owner) return false
+    this.probeOwner = owner
+    return true
+  }
+
+  releaseProbe(owner: string): void {
+    if (this.probeOwner === owner) this.probeOwner = undefined
+  }
+
   /** Milliseconds until a probe is allowed, if the circuit is open. */
   retryAfterMs(now: number = Date.now()): number | undefined {
     if (this.admit(now)) return undefined
@@ -262,8 +320,9 @@ export class CircuitBreaker {
    * while the circuit is open and cooling down are siblings observing the
    * same outage; they neither extend nor double the cooldown.
    */
-  recordFailure(failedAt: number = Date.now()): void {
+  recordFailure(failedAt: number = Date.now(), owner?: string): void {
     if (this.state === "open") {
+      if (this.probeOwner !== undefined && this.probeOwner !== owner) return
       if (failedAt < this.openedAt + this.cooldownMs) {
         // Still cooling down: not a probe, just another report of the same outage.
         return
@@ -274,6 +333,7 @@ export class CircuitBreaker {
       this.runStartedAt = failedAt
       this.openedAt = failedAt
       this.cooldownMs = Math.min(this.opts.maxCooldownMs, this.cooldownMs * 2)
+      this.probeOwner = undefined
       return
     }
     if (this.consecutiveFailures === 0) this.runStartedAt = failedAt
@@ -292,9 +352,10 @@ export class CircuitBreaker {
   recordSuccess(): void {
     this.state = "closed"
     this.consecutiveFailures = 0
-    this.cooldownMs = this.opts.baseCooldownMs
+    this.cooldownMs = Math.min(this.opts.baseCooldownMs, this.opts.maxCooldownMs)
     this.openedAt = 0
     this.runStartedAt = 0
+    this.probeOwner = undefined
   }
 
 }

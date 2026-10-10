@@ -9,8 +9,10 @@ import {
   classify,
   outageExpired,
   redispatchDelay,
+  retryAfterFromHeaders,
   retryDelay,
   type CircuitOptions,
+  type ClassifiedError,
 } from "./backoff.js"
 
 interface BackoffPluginOptions {
@@ -24,27 +26,47 @@ interface BackoffPluginOptions {
   }
 }
 
+interface ProviderRequest {
+  providerID: string
+  retryAfterAt?: number
+  blocked: boolean
+}
+
 interface ParkedSession {
   sessionID: string
   providerID: string
   parkedAt: number
   generation: number
-  timer: ReturnType<typeof setTimeout>
+  nextDispatchAt: number
+  dispatching: boolean
+  controller: AbortController
+  timer?: ReturnType<typeof setTimeout>
+}
+
+const MAX_TIMER_MS = 2_147_483_647
+const REDISPATCH_MARKER = "oc-backoff.redispatch"
+
+function recordOption(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
 }
 
 function numberOption(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.min(Number.MAX_SAFE_INTEGER, value)
+    : fallback
 }
 
 function parseOptions(raw: unknown): BackoffPluginOptions {
-  const opts = (raw ?? {}) as Record<string, unknown>
-  const circuit = (opts.circuit ?? {}) as Record<string, unknown>
-  const watchdog = (opts.watchdog ?? {}) as Record<string, unknown>
+  const opts = recordOption(raw)
+  const circuit = recordOption(opts.circuit)
+  const watchdog = recordOption(opts.watchdog)
   return {
     baseDelayMs: numberOption(opts.baseDelayMs, DEFAULT_BASE_DELAY_MS),
     maxDelayMs: numberOption(opts.maxDelayMs, DEFAULT_MAX_DELAY_MS),
     circuit: {
-      failureThreshold: numberOption(circuit.failureThreshold, DEFAULT_CIRCUIT.failureThreshold),
+      failureThreshold: Math.ceil(numberOption(circuit.failureThreshold, DEFAULT_CIRCUIT.failureThreshold)),
       baseCooldownMs: numberOption(circuit.baseCooldownMs, DEFAULT_CIRCUIT.baseCooldownMs),
       maxCooldownMs: numberOption(circuit.maxCooldownMs, DEFAULT_CIRCUIT.maxCooldownMs),
     },
@@ -62,11 +84,9 @@ export default Plugin.define({
     const opts = parseOptions(ctx.options)
     const circuits = new Map<string, CircuitBreaker>()
     const parked = new Map<string, ParkedSession>()
-    // Last provider a session retried against. session.execution.failed does
-    // not carry the model ref, so the retry hook's identity is the best
-    // available attribution for a parked session.
-    const lastProvider = new Map<string, string>()
-    const providerFor = (sessionID: string): string | undefined => lastProvider.get(sessionID)
+    const requests = new Map<string, ProviderRequest>()
+    const expired = new Set<string>()
+    const controller = new AbortController()
     const log = (message: string) => console.error(`[oc-backoff] ${message}`)
 
     function circuitFor(providerID: string): CircuitBreaker {
@@ -78,15 +98,49 @@ export default Plugin.define({
       return circuit
     }
 
-    // Layer 1: shape the retry policy inside OpenCode's attempt budget.
-    // OpenCode classifies the failure and proposes a decision; we replace the
-    // delay with full-jitter exponential backoff and veto retries that are
-    // either terminal (auth/invalid-request) or directed at an open circuit.
+    function cancel(sessionID: string): void {
+      const entry = parked.get(sessionID)
+      if (!entry) return
+      parked.delete(sessionID)
+      clearTimeout(entry.timer)
+      entry.controller.abort()
+      circuitFor(entry.providerID).releaseProbe(sessionID)
+    }
+
+    function policy(error: unknown, sessionID: string): ClassifiedError {
+      const classified = classify(error)
+      const retryAfterAt = requests.get(sessionID)?.retryAfterAt
+      if (retryAfterAt !== undefined) classified.retryAfterMs = Math.max(0, retryAfterAt - Date.now())
+      return classified
+    }
+
+    // The structured retry error omits headers. Capture them at the HTTP
+    // boundary, and track execution requests even if no retry hook ever fires.
+    const modelHook = await ctx.session.hook("model.request", (event) => {
+      if (event.kind !== "primary" && event.kind !== "compaction") return
+      requests.set(event.sessionID, { providerID: event.model.providerID, blocked: false })
+    })
+    const responseHook = await ctx.session.hook("http.response", (event) => {
+      if (event.kind !== "primary" && event.kind !== "compaction") return
+      const request = requests.get(event.sessionID)
+      if (!request || request.providerID !== event.model.providerID) return
+      const wait = retryAfterFromHeaders(event.response.headers)
+      request.retryAfterAt = wait === undefined ? undefined : Date.now() + wait
+    })
+    const promptHook = await ctx.session.hook("prompt", (event) => {
+      if (event.metadata?.[REDISPATCH_MARKER] === true) return
+      cancel(event.sessionID)
+      expired.delete(event.sessionID)
+      requests.delete(event.sessionID)
+    })
     const retryHook = await ctx.session.hook("retry", (event) => {
       const providerID = event.model.providerID
-      lastProvider.set(event.sessionID, providerID)
-      const classified = classify(event.error)
-
+      let request = requests.get(event.sessionID)
+      if (!request || request.providerID !== providerID) {
+        request = { providerID, blocked: false }
+        requests.set(event.sessionID, request)
+      }
+      const classified = policy(event.error, event.sessionID)
       if (classified.cls === "terminal") {
         event.decision = { retry: false }
         log(`terminal error for provider=${providerID}: not retrying`)
@@ -94,112 +148,220 @@ export default Plugin.define({
       }
 
       const circuit = circuitFor(providerID)
-      if (!circuit.admit()) {
-        const wait = circuit.retryAfterMs()
-        log(`circuit open for provider=${providerID}: failing fast (probe in ~${Math.round((wait ?? 0) / 1000)}s)`)
+      if (!circuit.acquireProbe(event.sessionID)) {
+        request.blocked = true
         event.decision = { retry: false }
+        log(`circuit open for provider=${providerID}: not retrying`)
         return
       }
 
-      const delay = retryDelay(classified, event.attempt, opts)
+      // OpenCode counts the initial physical request as attempt 1, so the
+      // first retry hook (attempt 2) uses the base backoff ceiling.
+      const delay = retryDelay(classified, event.attempt - 1, opts)
       const proposed = event.decision.retry ? event.decision.delay : undefined
-      log(
-        `provider=${providerID} attempt=${event.attempt} class=${classified.cls} ` +
-          `delay=${Math.round(delay / 1000)}s (was ${proposed === undefined ? "none" : `${Math.round(proposed / 1000)}s`})`,
-      )
       event.decision = { retry: true, delay }
+      log(`provider=${providerID} attempt=${event.attempt} class=${classified.cls} delay=${Math.round(delay / 1000)}s (was ${proposed ?? "none"}ms)`)
     })
 
-    async function park(sessionID: string, providerID: string): Promise<void> {
-      if (parked.has(sessionID)) return
-      const entry: ParkedSession = {
-        sessionID,
-        providerID,
-        parkedAt: Date.now(),
-        generation: 0,
-        timer: setTimeout(() => void reparkOrDispatch(entry), 0),
-      }
-      parked.set(sessionID, entry)
-      log(`parked session=${sessionID} provider=${providerID}; waiting for provider recovery`)
+    function active(entry: ParkedSession): boolean {
+      return !controller.signal.aborted && parked.get(entry.sessionID) === entry
     }
 
-    async function reparkOrDispatch(entry: ParkedSession): Promise<void> {
+    function arm(entry: ParkedSession): void {
+      if (!active(entry)) return
+      clearTimeout(entry.timer)
+      const deadline = entry.parkedAt + opts.watchdog.outageToleranceMs
+      const wakeAt = entry.dispatching ? deadline : Math.min(deadline, entry.nextDispatchAt)
+      // Long provider waits must not overflow setTimeout and become 1 ms.
+      entry.timer = setTimeout(() => void dispatch(entry), Math.max(1, Math.min(MAX_TIMER_MS, wakeAt - Date.now())))
+    }
+
+    function schedule(entry: ParkedSession, classified: ClassifiedError): void {
+      entry.dispatching = false
+      const jitter = redispatchDelay(entry.generation, {
+        baseDelayMs: opts.circuit.baseCooldownMs,
+        maxRedispatchDelayMs: opts.watchdog.maxRedispatchDelayMs,
+      })
+      const minimum = Math.min(opts.baseDelayMs, opts.watchdog.maxRedispatchDelayMs)
+      const directed = classified.retryAfterMs !== undefined || classified.cls === "quota"
+        ? retryDelay(classified, 1, opts)
+        : 0
+      entry.nextDispatchAt = Date.now() + Math.max(minimum, jitter, directed)
+      arm(entry)
+    }
+
+    async function dispatch(entry: ParkedSession): Promise<void> {
+      if (!active(entry)) return
       if (outageExpired(entry.parkedAt, opts.watchdog.outageToleranceMs)) {
-        parked.delete(entry.sessionID)
+        expired.add(entry.sessionID)
+        cancel(entry.sessionID)
         log(`session=${entry.sessionID} exceeded outage tolerance; giving up`)
         return
       }
-
+      if (entry.dispatching || Date.now() < entry.nextDispatchAt) {
+        arm(entry)
+        return
+      }
       const circuit = circuitFor(entry.providerID)
-      if (!circuit.admit()) {
-        const wait = circuit.retryAfterMs() ?? opts.circuit.baseCooldownMs
-        entry.timer = setTimeout(() => void reparkOrDispatch(entry), wait + 1_000)
+      if (!circuit.acquireProbe(entry.sessionID)) {
+        // A held half-open probe has no cooldown deadline: poll until its
+        // lifecycle event releases it. Every wake also enforces tolerance.
+        entry.nextDispatchAt = Date.now() + (circuit.retryAfterMs() ?? 1_000)
+        arm(entry)
         return
       }
 
+      entry.dispatching = true
+      const generation = entry.generation
+      arm(entry)
       try {
         await ctx.session.prompt({
           sessionID: entry.sessionID,
-          text: "The provider outage appears to have passed. Resume the task you were working on.",
-        })
-        // prompt() resolves once the message is queued, not when the model
-        // finishes. Wait for the run to settle so a still-down provider
-        // surfaces here as a rejection instead of an immediate fake success
-        // (which would unpark, reset the circuit, and spam re-dispatches).
-        await ctx.session.wait({ sessionID: entry.sessionID })
-        circuit.recordSuccess()
-        parked.delete(entry.sessionID)
-        log(`re-dispatched session=${entry.sessionID} after ${entry.generation} park generation(s)`)
+          text: "Resume the task from where the provider failure interrupted it. Avoid repeating completed work.",
+          metadata: { [REDISPATCH_MARKER]: true },
+          delivery: "queue",
+        }, { signal: entry.controller.signal })
+        // Admission and wait() are not execution outcomes. Keep this entry
+        // parked until execution.succeeded/failed/interrupted arrives.
+        if (active(entry)) log(`re-dispatched session=${entry.sessionID} generation=${generation}; awaiting execution outcome`)
       } catch (error) {
+        if (!active(entry) || !entry.dispatching || generation !== entry.generation) return
+        circuit.releaseProbe(entry.sessionID)
         const classified = classify(error)
         if (classified.cls === "terminal") {
-          parked.delete(entry.sessionID)
-          log(`session=${entry.sessionID} re-dispatch hit terminal error; giving up: ${String(error)}`)
+          cancel(entry.sessionID)
+          log(`session=${entry.sessionID} prompt admission failed; giving up: ${String(error)}`)
           return
         }
-        circuit.recordFailure()
+        // An API transport failure is not evidence the inference provider is
+        // down. Back off admission without incrementing its circuit counter.
         entry.generation += 1
-        const delay = redispatchDelay(entry.generation, {
-          baseDelayMs: opts.circuit.baseCooldownMs,
-          maxRedispatchDelayMs: opts.watchdog.maxRedispatchDelayMs,
-        })
-        log(
-          `session=${entry.sessionID} re-dispatch failed (class=${classified.cls}); ` +
-            `next attempt in ~${Math.round(delay / 60_000)}min`,
-        )
-        entry.timer = setTimeout(() => void reparkOrDispatch(entry), delay)
+        schedule(entry, classified)
+        log(`session=${entry.sessionID} prompt admission failed; backing off`)
       }
     }
 
-    // Layer 2: watchdog. When a session errors out after exhausting retries on
-    // a transient failure, park it and re-dispatch with exponential backoff
-    // until the provider recovers or the outage tolerance (default 12 h) is
-    // exceeded. This covers outages far longer than OpenCode's attempt budget.
-    const controller = new AbortController()
-    if (opts.watchdog.enabled) {
-      void (async () => {
+    // Always observe lifecycle events: the circuit remains functional when
+    // watchdog redispatch is disabled. A failed resumed execution is counted
+    // here exactly once, rather than inferred from prompt()/wait().
+    async function consumeEvents(): Promise<void> {
+      while (!controller.signal.aborted) {
         try {
           for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+            if (controller.signal.aborted) return
+            if (event.type === "session.compaction.ended") {
+              const providerID = event.data.model?.providerID
+              if (providerID) circuitFor(providerID).recordSuccess()
+              continue
+            }
+            if (event.type === "session.execution.started") {
+              const entry = parked.get(event.data.sessionID)
+              if (entry && !entry.dispatching) cancel(entry.sessionID)
+              continue
+            }
+            if (event.type === "session.model.selected" || event.type === "session.agent.selected" || event.type === "session.deleted" || event.type === "session.execution.interrupted") {
+              const sessionID = event.data.sessionID
+              cancel(sessionID)
+              const providerID = requests.get(sessionID)?.providerID
+              if (providerID) circuitFor(providerID).releaseProbe(sessionID)
+              requests.delete(sessionID)
+              if (event.type !== "session.execution.interrupted") expired.delete(sessionID)
+              continue
+            }
+            if (event.type === "session.step.ended" || event.type === "session.execution.succeeded") {
+              const sessionID = event.data.sessionID
+              const providerID = requests.get(sessionID)?.providerID ?? parked.get(sessionID)?.providerID
+              if (providerID) circuitFor(providerID).recordSuccess()
+              if (event.type === "session.execution.succeeded") {
+                cancel(sessionID)
+                requests.delete(sessionID)
+                expired.delete(sessionID)
+              }
+              continue
+            }
             if (event.type !== "session.execution.failed") continue
             const sessionID = event.data.sessionID
-            if (parked.has(sessionID)) continue
-            const classified = classify(event.data.error)
-            if (classified.cls === "terminal") continue
-            const providerID = providerFor(sessionID) ?? "unknown"
-            circuitFor(providerID).recordFailure()
-            await park(sessionID, providerID)
+            if (expired.has(sessionID)) {
+              requests.delete(sessionID)
+              continue
+            }
+            const entry = parked.get(sessionID)
+            if (entry && !entry.dispatching) continue
+            const classified = policy(event.data.error, sessionID)
+            const request = requests.get(sessionID)
+            const providerID = request?.providerID ?? entry?.providerID
+            if (classified.cls === "terminal") {
+              cancel(sessionID)
+              if (providerID) circuitFor(providerID).releaseProbe(sessionID)
+              requests.delete(sessionID)
+              continue
+            }
+            // Never merge unattributed failures into a shared "unknown"
+            // provider circuit. Model requests supply reliable attribution.
+            if (!providerID) {
+              log(`session=${sessionID} transient failure has no provider attribution; leaving it alone`)
+              continue
+            }
+            const circuit = circuitFor(providerID)
+            if (!request?.blocked) {
+              const before = circuit.snapshot()
+              circuit.recordFailure(Date.now(), sessionID)
+              const after = circuit.snapshot()
+              if (before.state !== after.state || before.cooldownMs !== after.cooldownMs) {
+                log(`provider=${providerID} circuit=${after.state} cooldown=${after.cooldownMs ?? 0}ms`)
+              }
+            }
+            circuit.releaseProbe(sessionID)
+            if (!opts.watchdog.enabled) {
+              requests.delete(sessionID)
+              continue
+            }
+            if (entry) {
+              if (entry.providerID !== providerID) {
+                circuitFor(entry.providerID).releaseProbe(sessionID)
+                entry.providerID = providerID
+              }
+              entry.generation += 1
+              schedule(entry, classified)
+            } else {
+              const parkedEntry: ParkedSession = {
+                sessionID,
+                providerID,
+                parkedAt: Date.now(),
+                generation: 0,
+                nextDispatchAt: 0,
+                dispatching: false,
+                controller: new AbortController(),
+              }
+              parked.set(sessionID, parkedEntry)
+              schedule(parkedEntry, classified)
+              log(`parked session=${sessionID} provider=${providerID}; waiting to probe recovery`)
+            }
           }
+          if (!controller.signal.aborted) log("event stream ended; reconnecting")
         } catch (error) {
-          if (!controller.signal.aborted) log(`event stream ended unexpectedly: ${String(error)}`)
+          if (!controller.signal.aborted) log(`event stream failed; reconnecting: ${String(error)}`)
         }
-      })()
+        if (controller.signal.aborted) return
+        await new Promise<void>((resolve) => {
+          const done = () => {
+            clearTimeout(timer)
+            controller.signal.removeEventListener("abort", done)
+            resolve()
+          }
+          const timer = setTimeout(done, 1_000)
+          controller.signal.addEventListener("abort", done, { once: true })
+        })
+      }
     }
 
-    return () => {
+    void consumeEvents()
+    return async () => {
       controller.abort()
-      void retryHook.dispose()
-      for (const entry of parked.values()) clearTimeout(entry.timer)
-      parked.clear()
+      for (const sessionID of parked.keys()) cancel(sessionID)
+      requests.clear()
+      expired.clear()
+      await Promise.all([modelHook, responseHook, promptHook, retryHook].map((hook) => hook.dispose()))
     }
   },
 })

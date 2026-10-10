@@ -6,6 +6,7 @@ import {
   classify,
   outageExpired,
   redispatchDelay,
+  retryAfterFromHeaders,
   retryDelay,
 } from "../dist/backoff.js"
 
@@ -214,4 +215,83 @@ test("outageExpired enforces the tolerance window", () => {
   const tolerance = 43_200_000
   assert.equal(outageExpired(parkedAt, tolerance, parkedAt + tolerance - 1), false)
   assert.equal(outageExpired(parkedAt, tolerance, parkedAt + tolerance), true)
+})
+
+test("classify respects structured OpenCode V2 provider types", () => {
+  for (const [type, cls] of [
+    ["provider.internal", "server-error"],
+    ["provider.transport", "network"],
+    ["provider.timeout", "network"],
+    ["provider.rate-limit", "rate-limit"],
+    ["provider.quota", "quota"],
+  ]) assert.equal(classify({ type, message: "request failed" }).cls, cls, type)
+  assert.equal(classify({ type: "provider.quota", status: 429, message: "limit reached" }).cls, "quota")
+})
+
+test("explicit terminal SDK types win over incidental transient words and status", () => {
+  for (const type of ["provider.auth", "provider.invalid-request", "provider.no-route", "provider.content-filter", "permission.rejected", "tool.execution"]) {
+    assert.equal(classify({ type, message: "capacity unavailable", status: 503 }).cls, "terminal", type)
+  }
+  assert.equal(classify({ status: 405, message: "capacity unavailable" }).cls, "terminal")
+})
+
+test("classify reads the V2 response body for quota details", () => {
+  assert.equal(classify({ status: 429, response: { body: '{"error":{"code":"insufficient_quota"}}' } }).cls, "quota")
+  assert.equal(classify({ type: "UsageLimitError", message: "limit reached" }).cls, "quota")
+  assert.equal(classify({ type: "FreeUsageLimitError", message: "limit reached" }).cls, "quota")
+})
+
+test("classify recognizes timeout messages and nested network error codes", () => {
+  assert.equal(classify({ status: 408 }).cls, "network")
+  assert.equal(classify(new Error("request timed out")).cls, "network")
+  assert.equal(classify(new Error("request failed", { cause: { code: "ETIMEDOUT" } })).cls, "network")
+  assert.equal(classify({ code: "UND_ERR_SOCKET" }).cls, "network")
+  const cycle = { message: "unknown" }
+  cycle.cause = cycle
+  assert.equal(classify(cycle).cls, "terminal", "cause traversal is bounded")
+})
+
+test("Retry-After parsing handles case, milliseconds, seconds, and HTTP dates", () => {
+  assert.equal(retryAfterFromHeaders({ "Retry-After-Ms": "12.5", "retry-after": "10" }), 13)
+  assert.equal(retryAfterFromHeaders(new Headers({ "Retry-After": "1.5" })), 1_500)
+  const now = Date.UTC(2030, 9, 21, 7, 27)
+  assert.equal(retryAfterFromHeaders({ "retry-after": "Mon, 21 Oct 2030 07:28:00 GMT" }, now), 60_000)
+  assert.equal(retryAfterFromHeaders({ "retry-after": "21 Oct 2030 07:28:00 GMT" }, now), 60_000, "numeric day is not parsed as seconds")
+  assert.equal(retryAfterFromHeaders({ "retry-after": "Mon, 21 Oct 2030 07:26:00 GMT" }, now), 0)
+})
+
+test("Retry-After parsing rejects partial numbers, negative values, and overflow", () => {
+  for (const value of ["-1", "120junk", "Infinity", "NaN", "", "9".repeat(400)]) {
+    assert.equal(retryAfterFromHeaders({ "retry-after-ms": value }), undefined, value)
+    assert.equal(retryAfterFromHeaders({ "retry-after": value }), undefined, value)
+  }
+  assert.equal(retryAfterFromHeaders({ "retry-after-ms": "invalid", "retry-after": "2" }), 2_000)
+  assert.equal(classify({ status: 429, responseHeaders: { "bad header name": "ignored", "Retry-After": "2" } }).retryAfterMs, 2_000)
+})
+
+test("transient delay cap wins when configured below the base delay", () => {
+  assert.equal(retryDelay({ cls: "rate-limit", retryAfterMs: 100 }, 1, { baseDelayMs: 2_000, maxDelayMs: 500 }), 500)
+})
+
+test("initial circuit cooldown respects a cap below the base cooldown", () => {
+  const circuit = new CircuitBreaker({ failureThreshold: 1, baseCooldownMs: 2_000, maxCooldownMs: 500 })
+  circuit.recordFailure(0)
+  assert.equal(circuit.snapshot(0).cooldownMs, 500)
+  circuit.recordSuccess()
+  circuit.recordFailure(1_000)
+  assert.equal(circuit.snapshot(1_000).cooldownMs, 500)
+})
+
+test("half-open probe ownership prevents sibling probes and failure reports", () => {
+  const circuit = new CircuitBreaker({ failureThreshold: 1, baseCooldownMs: 1_000, maxCooldownMs: 8_000 })
+  circuit.recordFailure(0)
+  assert.equal(circuit.acquireProbe("s1", 1_000), true)
+  assert.equal(circuit.acquireProbe("s2", 1_000), false)
+  circuit.recordFailure(1_001, "s2")
+  assert.equal(circuit.snapshot(1_001).cooldownMs, 1_000)
+  assert.equal(circuit.acquireProbe("s1", 1_001), true)
+  circuit.releaseProbe("s1")
+  assert.equal(circuit.acquireProbe("s2", 1_001), true)
+  circuit.recordFailure(1_002, "s2")
+  assert.equal(circuit.snapshot(1_002).cooldownMs, 2_000)
 })
