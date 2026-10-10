@@ -142,6 +142,11 @@ export default Plugin.define({
           sessionID: entry.sessionID,
           text: "The provider outage appears to have passed. Resume the task you were working on.",
         })
+        // prompt() resolves once the message is queued, not when the model
+        // finishes. Wait for the run to settle so a still-down provider
+        // surfaces here as a rejection instead of an immediate fake success
+        // (which would unpark, reset the circuit, and spam re-dispatches).
+        await ctx.session.wait({ sessionID: entry.sessionID })
         circuit.recordSuccess()
         parked.delete(entry.sessionID)
         log(`re-dispatched session=${entry.sessionID} after ${entry.generation} park generation(s)`)
